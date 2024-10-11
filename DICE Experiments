@@ -1,0 +1,487 @@
+# 1. Bibliotheken importieren
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.impute import KNNImputer
+from scipy.stats import randint
+import dice_ml
+from scipy.spatial.distance import cdist
+from scipy.stats import median_abs_deviation
+from scipy.spatial.distance import euclidean
+from scipy.spatial.distance import pdist, squareform
+import torch
+from sklearn.metrics import confusion_matrix, accuracy_score
+
+
+# 2. URL laden und Daten einlesen
+url = "https://raw.githubusercontent.com/jbrownlee/Datasets/master/pima-indians-diabetes.data.csv"
+column_names = ["Pregnancies", "Glucose", "BloodPressure", "SkinThickness",
+                "Insulin", "BMI", "DiabetesPedigreeFunction", "Age", "Outcome"]
+dataset = pd.read_csv(url, names=column_names)
+
+# 3. Nullwerte behandeln
+median_columns = ['Glucose', 'BloodPressure', 'BMI']
+for column in median_columns:
+    dataset[column] = dataset[column].replace(0, np.nan)
+    dataset[column].fillna(dataset[column].median(), inplace=True)
+
+# KNN-Imputer für SkinThickness und Insulin
+dataset[['SkinThickness', 'Insulin']] = dataset[['SkinThickness', 'Insulin']].replace(0, np.nan)
+knn_imputer = KNNImputer(n_neighbors=5)
+dataset[['SkinThickness', 'Insulin']] = knn_imputer.fit_transform(dataset[['SkinThickness', 'Insulin']])
+
+# 4. Merkmale und Zielvariable definieren
+X = dataset.drop("Outcome", axis=1)  # Behalte es als DataFrame
+y = dataset["Outcome"].values  # Konvertiere zu NumPy-Array
+
+# 5. Train-Test-Split
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# 6. Merkmale standardisieren
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# Umwandeln der skalierten Daten zurück in DataFrames mit Spaltennamen
+#X_train_scaled = pd.DataFrame(X_train_scaled, columns=X_train.columns)
+#X_test_scaled = pd.DataFrame(X_test_scaled, columns=X_test.columns)
+
+
+# 7. Random Forest Modell instanziieren und trainieren
+model = RandomForestClassifier(random_state=42)
+model.fit(X_train, y_train)  # Trainiere auf dem DataFrame
+
+# 8. Modell evaluieren und Vorhersagen treffen
+y_pred = model.predict(X_test)
+
+# 9. Confusion Matrix und accuracy score berechnen und anzeigen
+cm = confusion_matrix(y_test, y_pred)
+print("Confusion Matrix:")
+print(cm)
+
+accuracy = accuracy_score(y_test, y_pred)
+print(f"Accuracy: {accuracy:.2f}")
+
+# 10. Sparsity
+
+def average_feature_difference(query_instance, cf_list):
+    total_diff_count = 0  # Zähler für die gesamte Anzahl der unterschiedlichen Features
+    num_cfs = 0  # Zähler für die Anzahl der Counterfactuals
+
+    # Hole die Feature-Namen aus der Query-Instanz
+    feature_names = query_instance.columns
+
+    # Iteriere über die Counterfactuals und vergleiche sie mit der Query-Instanz
+    for cf_example in cf_list:
+        cf_df = cf_example.final_cfs_df  # Extrahiere den DataFrame der counterfactuals
+        
+        for i, cf in cf_df.iterrows():
+            diff_count = 0  # Zähler für unterschiedliche Features bei diesem CF
+
+            # Iteriere über die Features und vergleiche die Werte mit der Query-Instanz
+            for feature in feature_names:
+                query_value = query_instance[feature].values[0]  # Wert der Query-Instanz für dieses Feature
+                cf_value = cf[feature]  # Wert des Counterfactuals für dieses Feature
+
+                if query_value != cf_value:  # Wenn die Werte unterschiedlich sind
+                    diff_count += 1
+
+            total_diff_count += diff_count  # Zähle die Unterschiede für dieses CF
+            num_cfs += 1  # Zähler für die Anzahl der CFs erhöhen
+
+    # Berechne den Durchschnitt der unterschiedlichen Features
+    avg_diff_count = total_diff_count / num_cfs if num_cfs > 0 else 0
+    return avg_diff_count
+
+# 11. Size
+
+def percentage_generated_counterfactuals(cf_list, desired_count):
+    total_generated = 0
+    
+    # Iteriere über die Counterfactuals und zähle die Anzahl
+    for cf_example in cf_list:
+        cf_df = cf_example.final_cfs_df  # Extrahiere den DataFrame der Counterfactuals
+        total_generated += len(cf_df)  # Zähle die Anzahl der Zeilen (Counterfactuals)
+
+    # Berechne den Prozentsatz
+    percentage = (total_generated / desired_count) * 100 if desired_count > 0 else 0
+    
+    return percentage
+
+
+# 12. Validity
+
+def validate_counterfactuals_percentage(query_instance, cf_list, model):
+    # Vorhersage für die Query-Instanz
+    query_prediction = model.predict(query_instance)[0]
+    
+    # Zähler für gültige Counterfactuals
+    valid_count = 0
+    total_count = 0
+
+    # Iteriere über die Counterfactuals und überprüfe deren Vorhersage
+    for cf_example in cf_list:
+        cf_df = cf_example.final_cfs_df  # Extrahiere den DataFrame der counterfactuals
+        
+        for i, cf in cf_df.iterrows():
+            # Entferne die 'Outcome'-Spalte, falls vorhanden
+            if 'Outcome' in cf.index:
+                cf = cf.drop('Outcome')
+            
+            # Erstelle einen DataFrame für das Counterfactual (eine Instanz)
+            cf_instance = pd.DataFrame([cf.values], columns=cf.index)
+            
+            # Vorhersage des Modells für das Counterfactual
+            cf_prediction = model.predict(cf_instance)[0]
+
+            # Prüfe, ob die Vorhersage der entgegengesetzten Klasse entspricht
+            if cf_prediction != query_prediction:
+                valid_count += 1  # Gültiges Counterfactual gefunden
+            total_count += 1  # Erhöhe den Zähler für alle Counterfactuals
+
+    # Berechne den Prozentsatz der gültigen Counterfactuals
+    if total_count == 0:
+        return 0.0  # Schutz vor Division durch 0
+    valid_percentage = (valid_count / total_count) * 100
+    
+    return valid_percentage
+
+
+
+
+
+# 13. Actionability
+
+def nbr_actionable_cf(query_instance, cf_list, variable_features):
+    nbr_actionable = 0  # Zähler für die Anzahl der actionable counterfactuals
+    query_instance_values = query_instance.values[0]  # Werte der ursprünglichen Instanz
+
+    # Überprüfen, ob die Zielvariable in den Features enthalten ist und sie ggf. entfernen
+    variable_features = [feature for feature in variable_features if feature in query_instance.columns]
+    
+    # Iteriere über jedes kontrafaktische Beispiel
+    for cf_example in cf_list:
+        cf_df = cf_example.final_cfs_df  # Extrahiere den DataFrame der counterfactuals
+        
+        for i, cf in cf_df.iterrows():
+            constraint_violated = False
+            
+            # Überprüfe, ob ein nicht in 'variable_features' enthaltenes Feature geändert wurde
+            for feature in cf_df.columns:
+                if feature in query_instance.columns and feature not in variable_features:
+                    if cf[feature] != query_instance_values[X_test.columns.get_loc(feature)]:
+                        constraint_violated = True
+                        break
+            
+            # Wenn keine Einschränkungen verletzt wurden, wird das CF als "actionable" betrachtet
+            if not constraint_violated:
+                nbr_actionable += 1
+    
+    return nbr_actionable
+
+
+
+# 14. Diversity
+
+def calculate_diversity(cf_list, metric='euclidean'):
+    # Extrahiere die DataFrames aus der Liste der Counterfactual-Objekte
+    cf_arrays = [cf.final_cfs_df.drop(columns=['Outcome'], errors='ignore').to_numpy() for cf in cf_list]
+    
+    # Staple die Counterfactual-Arrays in einem einzigen Array
+    cf_array = np.vstack(cf_arrays)
+    num_cfs = cf_array.shape[0]
+    
+    if metric == 'euclidean':
+        distances = []  # Liste zur Speicherung der Distanzen
+        for i in range(num_cfs):
+            for j in range(i + 1, num_cfs):
+                distance = np.linalg.norm(cf_array[i] - cf_array[j])  # Berechnung der euklidischen Distanz
+                distances.append(distance)
+    
+    elif metric == 'mad':
+        # Berechnung der Median Absolute Deviation (MAD)
+        mad = np.median(np.abs(cf_array[:, np.newaxis] - cf_array), axis=1)
+        distances = mad.flatten()  # Flatten, um es einfacher zu handhaben
+
+    # Rückgabe des Durchschnitts der Distanzen
+    return np.mean(distances) if distances else 0.0
+
+
+
+# 15. Proximity
+
+def average_distance(query_instance, cf_list, metric='euclidean'):
+    # Extrahiere die DataFrames aus der Liste der Counterfactual-Objekte
+    cf_arrays = [cf.final_cfs_df.drop(columns=['Outcome'], errors='ignore') for cf in cf_list]
+    
+    # Staple die Counterfactual-DataFrames in einem einzigen DataFrame
+    cf_combined = pd.concat(cf_arrays, ignore_index=True)
+
+    # Konvertiere input_value zu einem NumPy-Array und forme es um
+    query_instance_value_array = query_instance.values.reshape(1, -1)
+
+    # Berechne die Distanzen basierend auf der ausgewählten Metrik
+    if metric == 'euclidean':
+        distances = cdist(query_instance_value_array, cf_combined.values, metric='euclidean')
+    elif metric == 'mad':
+        # Hier könnte eine Funktion für die MAD-Distanz implementiert werden
+        raise NotImplementedError("MAD distance calculation is not implemented yet.")
+
+    # Berechne die durchschnittliche Distanz
+    avg_distance = distances.mean()
+    return avg_distance
+
+
+# 16. Plausibility
+
+def calculate_plausibility_rf(query_instance, cf_list, model, X_test, y_test_np, feature_names):
+    sum_dist = 0.0
+
+    # Sicherstellen, dass die Counterfactuals nur die Features enthalten
+    if 'Outcome' in cf_list.columns:
+        cf_list = cf_list.drop(columns=['Outcome'])
+
+    # Konvertiere die Query-Instanz in ein DataFrame
+    query_instance_df = pd.DataFrame(query_instance.values.reshape(1, -1), columns=feature_names)
+
+    for index, cf in cf_list.iterrows():  # Iteriere über die Zeilen des DataFrames
+        # Überprüfen, ob 'cf' eine Serie ist
+        if isinstance(cf, pd.Series):
+            cf_features_only = cf[feature_names]  # Wähle nur die Features aus
+        else:
+            raise ValueError("Counterfactual is not a valid DataFrame or Series")
+
+        # Vorhersage für das kontrafaktische Beispiel (als DataFrame)
+        cf_df = pd.DataFrame(cf_features_only.values.reshape(1, -1), columns=feature_names)  # DataFrame für Vorhersage
+        y_cf_val = model.predict(cf_df)[0]  # Vorhersage erhalten
+
+        # Finde ähnliche Instanzen im Testset basierend auf der Vorhersage
+        X_test_y = X_test[(y_test_np == y_cf_val)]
+
+        if X_test_y.empty:
+            continue  # Überspringe, wenn keine passenden Instanzen gefunden werden
+
+        # Berechne die Distanz zu den nächsten Nachbarn
+        neigh_dist = np.linalg.norm(query_instance_df.values - X_test_y.values, axis=1)
+        idx_neigh = np.argmin(neigh_dist)
+        closest = X_test_y.iloc[idx_neigh]
+
+        # Berechne die Distanz zwischen dem kontrafaktischen Beispiel und dem nächsten Nachbarn
+        d = np.linalg.norm(cf_features_only.values - closest.values)
+        sum_dist += d
+
+    # Durchschnittliche Distanz (Plausibilität)
+    return sum_dist / len(cf_list) if len(cf_list) > 0 else 0.0
+
+# 17. Methode zur Evaluierung der Counterfactuals
+
+def evaluate_counterfactuals(query_instance, cf_list, variable_features, model, X_test, y_test, feature_names, desired_count):
+    # Size
+    size = percentage_generated_counterfactuals(cf_list, desired_count) 
+    #print("Size:", size)
+
+    # Validity
+    percentage_valid = validate_counterfactuals_percentage(query_instance, cf_list, model)
+    #print("Prozentualer Anteil valider kontrafaktischer Erklärungen:", percentage_valid)
+
+    # Actionability
+    actionable_count = nbr_actionable_cf(query_instance, cf_list, variable_features)
+    #print("Anzahl umsetzbarer kontrafaktischer Erklärungen (Actionability):", actionable_count)
+
+    # Diversity
+    diversity_score = calculate_diversity(cf_list)
+    #print("Durchschnittliche euklidische Distanz zwischen den Counterfactuals (Diversity):", diversity_score)
+
+    # Proximity
+    proximity_score = average_distance(query_instance, cf_list)
+    #print("Durchschnittliche Euklidische Distanz (Proximity):", proximity_score)
+
+    # Plausibility
+    plausibility_score_rf = calculate_plausibility_rf(query_instance, cf_list[0].final_cfs_df, model, X_test, y_test, feature_names)
+    #print("Plausibility Score:", plausibility_score_rf)
+
+    # Sparsity
+    sparsity_count = average_feature_difference(query_instance, cf_list)
+    #print(f"Durchschnittliche Anzahl der unterschiedlichen Features zwischen Query-Instanz und Counterfactuals (Sparsity): {sparsity_count:.2f}")
+
+
+    return {
+        "size": size,
+        "validity": percentage_valid,
+        "actionability": actionable_count,
+        "diversity": diversity_score,
+        "proximity": proximity_score,
+        "plausibility": plausibility_score_rf,
+        "sparsity": sparsity_count
+    }
+
+
+
+# 18. Methode zur Evaluierung der durchschnittlichen Ergebnisse bei mehreren Durchläufen mit mehreren query_instances
+def evaluate_average_counterfactuals(dice_exp, X_test, total_CFs, desired_class, 
+                                      features_to_vary, permitted_range, proximity_weight, 
+                                      diversity_weight, variable_features, model, y_test, feature_names, desired_count, num_iterations=10):
+    # Initialisiere Variablen zur Speicherung der kumulierten Ergebnisse
+    cumulative_results = {
+        "size": 0,
+        "validity": 0,
+        "actionability": 0,
+        "diversity": 0,
+        "proximity": 0,
+        "plausibility": 0,
+        "sparsity": 0
+    }
+
+    # Anzahl der Testinstanzen
+    num_instances = len(X_test)
+
+    # Iteriere über die Anzahl der gewünschten Wiederholungen
+    for i in range(num_iterations):
+        # Berechne den Index der aktuellen Abfrageinstanz
+        query_instance_index = i % num_instances  # Um sicherzustellen, dass wir nicht über die Anzahl der Instanzen hinausgehen
+        query_instance = X_test.iloc[query_instance_index:query_instance_index + 1]
+
+        # Generiere kontrafaktische Erklärungen
+        cf = dice_exp.generate_counterfactuals(
+            query_instance,
+            total_CFs=total_CFs,
+            desired_class=desired_class,
+            features_to_vary=features_to_vary,
+            permitted_range=permitted_range,
+            proximity_weight=proximity_weight,
+            diversity_weight=diversity_weight
+        )
+
+        # Evaluierung der Counterfactuals
+        results = evaluate_counterfactuals(query_instance, cf.cf_examples_list, variable_features, model, X_test, y_test, feature_names, desired_count)
+
+        # Kumulierte Ergebnisse aktualisieren
+        for key in cumulative_results:
+            cumulative_results[key] += results[key]
+
+    # Durchschnittliche Ergebnisse berechnen
+    average_results = {key: value / num_iterations for key, value in cumulative_results.items()}
+
+    return average_results
+
+
+# 19. Definiere die Parameter
+
+# DiCE für kontrafaktische Erklärungen einrichten
+# Model and data interface for DiCE
+m = dice_ml.Model(model=model, backend="sklearn")  # sklearn Backend für Random Forest
+d = dice_ml.Data(dataframe=dataset, continuous_features=["Pregnancies", "Glucose", "BloodPressure",
+                                                         "SkinThickness", "Insulin", "BMI",
+                                                         "DiabetesPedigreeFunction", "Age"],
+                 outcome_name="Outcome")
+
+
+
+# DiCE-Explainer erstellen
+dice_exp = dice_ml.Dice(d, m, method="random")
+
+# Query instance
+query_instance_index = 2  # Wähle den Index der Instanz aus X_test
+query_instance = X_test.iloc[query_instance_index:query_instance_index + 1]
+
+# weitere parameter für dice_exp
+total_CFs = 2  # Anzahl der gewünschten Counterfactuals
+desired_class = "opposite"  # Zielklasse
+features_to_vary = ['Glucose', 'BloodPressure', 'Insulin', 'BMI']  # Features, die verändert werden sollen
+permitted_range = {'Glucose': [44,199], 'BloodPressure': [24,122],'Insulin': [14,846], 'BMI': [18,67], 'Pregnancies': [0, 17]}  # Erlaubte Wertebereiche
+proximity_weight = 1.0  # Gewichtung für Nähe
+diversity_weight = 1.0  # Gewichtung für Diversität
+
+# dice_exp
+cf = dice_exp.generate_counterfactuals(query_instance, total_CFs, desired_class,
+                                       features_to_vary=features_to_vary, permitted_range=permitted_range, proximity_weight=proximity_weight, diversity_weight=diversity_weight)
+
+# parameter für model evaluation
+num_iterations = 50  # Anzahl der Wiederholungen
+desired_count = 2
+feature_names = ['Pregnancies', 'Glucose', 'BloodPressure', 'SkinThickness', 'Insulin', 'BMI', 'DiabetesPedigreeFunction', 'Age']
+
+# 20.Beispielausgabe
+print(cf.visualize_as_dataframe(show_only_changes=True))
+results = evaluate_counterfactuals(query_instance, cf.cf_examples_list, features_to_vary, model, X_test, y_test,feature_names, desired_count)
+print("Ergebnisse der Evaluierung:", results)
+
+
+# 21.Ergebisse für total_CFs=2, proximity_weight = 1.0, diversity_weight = 1.0
+average_results = evaluate_average_counterfactuals(
+    dice_exp,
+    X_test,
+    total_CFs,
+    desired_class,
+    features_to_vary,
+    permitted_range,
+    proximity_weight,
+    diversity_weight,
+    features_to_vary,
+    model,
+    y_test,
+    feature_names,
+    desired_count,
+    num_iterations
+)
+
+# Ausgabe der durchschnittlichen Ergebnisse
+print("Durchschnittliche Ergebnisse der Evaluierung für 2 generierte counterfactuals:")
+print(average_results)
+
+
+# 22. Ergebisse für total_CFs=2, proximity_weight = 1.0, diversity_weight = 1.0
+total_CFs = 4
+desired_count = 4
+average_results = evaluate_average_counterfactuals(
+    dice_exp,
+    X_test,
+    total_CFs,
+    desired_class,
+    features_to_vary,
+    permitted_range,
+    proximity_weight,
+    diversity_weight,
+    features_to_vary,
+    model,
+    y_test,
+    feature_names,
+    desired_count,
+    num_iterations
+)
+
+# Ausgabe der durchschnittlichen Ergebnisse
+print("Durchschnittliche Ergebnisse der Evaluierung für 4 generierte counterfactuals:")
+print(average_results)
+
+
+
+# 23. Ergebisse für total_CFs=8, proximity_weight = 1.0, diversity_weight = 1.0
+total_CFs = 8
+desired_count = 8
+
+average_results = evaluate_average_counterfactuals(
+    dice_exp,
+    X_test,
+    total_CFs,
+    desired_class,
+    features_to_vary,
+    permitted_range,
+    proximity_weight,
+    diversity_weight,
+    features_to_vary,
+    model,
+    y_test,
+    feature_names,
+    desired_count,
+    num_iterations
+)
+
+# Ausgabe der durchschnittlichen Ergebnisse
+print("Durchschnittliche Ergebnisse der Evaluierung für 8 generierte counterfactuals")
+print(average_results)
+
+
